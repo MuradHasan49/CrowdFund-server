@@ -391,13 +391,26 @@ app.post('/api/auth/logout', (_req: Request, res: Response) => {
 });
 
 // ── GET /api/auth/me ─────────────────────────────────
-app.get('/api/auth/me', verifyToken, async (req: Request, res: Response) => {
-  const user = await UserModel.findById(req.user!.id);
-  if (!user) {
-    res.status(404).json({ success: false, error: 'User not found.' });
+app.get('/api/auth/me', async (req: Request, res: Response) => {
+  const token = req.cookies?.cf_token as string | undefined;
+  if (!token) {
+    res.json({ success: false, data: null });
     return;
   }
-  res.json({ success: true, data: stripUser(user) });
+
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET!) as { id: string };
+    const user = await UserModel.findById(payload.id);
+    
+    if (!user) {
+      res.json({ success: false, data: null });
+      return;
+    }
+    
+    res.json({ success: true, data: stripUser(user) });
+  } catch (err) {
+    res.json({ success: false, data: null });
+  }
 });
 
 // ============================================================
@@ -1092,8 +1105,29 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 
 
 // ============================================================
-// 15. SERVER LISTEN
+// 15. SERVER LISTEN & SEEDING
 // ============================================================
-app.listen(PORT, () => {
+const seedAdmin = async () => {
+  try {
+    const existingAdmin = await UserModel.findOne({ email: 'admin@crowdfund.com' });
+    if (!existingAdmin) {
+      const hashedPassword = await bcrypt.hash('Admin@12345', BCRYPT_SALT_ROUNDS);
+      await UserModel.create({
+        name: 'System Admin',
+        email: 'admin@crowdfund.com',
+        password: hashedPassword,
+        role: 'admin',
+        credits: 99999,
+        isActive: true,
+      });
+      console.error('✅ Admin user seeded: admin@crowdfund.com');
+    }
+  } catch (err) {
+    console.error('❌ Failed to seed admin user:', err);
+  }
+};
+
+app.listen(PORT, async () => {
+  await seedAdmin();
   console.error(`✅ CrowdFund server running at http://localhost:${PORT}`);
 });
