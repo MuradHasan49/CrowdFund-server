@@ -657,8 +657,164 @@ app.patch('/api/campaigns/:id/status', verifyToken, roleGuard('admin'), async (r
 
 // ============================================================
 // 10. CONTRIBUTION ROUTES
-// (Populated in Phase 5)
 // ============================================================
+
+// ── POST /api/contributions  (Supporter — create contribution) ─
+app.post('/api/contributions', verifyToken, roleGuard('supporter'), async (req: Request, res: Response) => {
+  const { campaign_id, amount, message } = req.body as {
+    campaign_id: string;
+    amount: number;
+    message?: string;
+  };
+
+  if (!campaign_id || !amount) {
+    res.status(400).json({ success: false, error: 'campaign_id and amount are required.' });
+    return;
+  }
+
+  const campaign = await CampaignModel.findById(campaign_id);
+  if (!campaign) {
+    res.status(404).json({ success: false, error: 'Campaign not found.' });
+    return;
+  }
+  if (campaign.status !== 'active') {
+    res.status(400).json({ success: false, error: 'You can only contribute to active campaigns.' });
+    return;
+  }
+  if (Number(amount) < campaign.minimum_contribution) {
+    res.status(400).json({
+      success: false,
+      error: `Minimum contribution is ${campaign.minimum_contribution} credits.`,
+    });
+    return;
+  }
+
+  // Atomic credit deduction — $gte guard prevents going below 0
+  const supporter = await UserModel.findOneAndUpdate(
+    { _id: req.user!.id, credits: { $gte: Number(amount) } },
+    { $inc: { credits: -Number(amount) } },
+    { new: true }
+  );
+  if (!supporter) {
+    res.status(400).json({ success: false, error: 'Insufficient credits. Please purchase more credits.' });
+    return;
+  }
+
+  const contribution = await ContributionModel.create({
+    campaign_id:     campaign._id,
+    campaign_title:  campaign.title,
+    supporter_id:    req.user!.id,
+    supporter_name:  supporter.name,
+    supporter_email: supporter.email,
+    amount:          Number(amount),
+    message:         message?.trim() || '',
+    status:          'pending',
+  });
+
+  const obj = contribution.toObject() as unknown as Record<string, unknown>;
+  const { _id, __v, ...rest } = obj;
+  res.status(201).json({
+    success: true,
+    data: { id: (contribution._id as Types.ObjectId).toString(), ...rest },
+    message: 'Contribution submitted. Awaiting creator approval.',
+  });
+});
+
+// ── GET /api/contributions/mine  (Supporter — own contributions) ─
+// ⚠️ MUST be before /:id
+app.get('/api/contributions/mine', verifyToken, roleGuard('supporter'), async (req: Request, res: Response) => {
+  const contributions = await ContributionModel.find({ supporter_id: req.user!.id })
+    .sort({ createdAt: -1 })
+    .lean();
+
+  res.json({
+    success: true,
+    data: contributions.map((c) => {
+      const { _id, __v, ...rest } = c as typeof c & { __v?: number };
+      return { id: (_id as Types.ObjectId).toString(), ...rest };
+    }),
+  });
+});
+
+// ── GET /api/contributions/pending  (Creator — pending on own campaigns) ─
+// ⚠️ MUST be before /:id
+app.get('/api/contributions/pending', verifyToken, roleGuard('creator'), async (req: Request, res: Response) => {
+  // Get all campaigns belonging to this creator
+  const myCampaigns = await CampaignModel.find({ creator_id: req.user!.id }).select('_id').lean();
+  const campaignIds = myCampaigns.map((c) => c._id);
+
+  const contributions = await ContributionModel.find({
+    campaign_id: { $in: campaignIds },
+    status: 'pending',
+  })
+    .sort({ createdAt: -1 })
+    .lean();
+
+  res.json({
+    success: true,
+    data: contributions.map((c) => {
+      const { _id, __v, ...rest } = c as typeof c & { __v?: number };
+      return { id: (_id as Types.ObjectId).toString(), ...rest };
+    }),
+  });
+});
+
+// ── PATCH /api/contributions/:id/approve  (Creator — approve + add to raised) ─
+app.patch('/api/contributions/:id/approve', verifyToken, roleGuard('creator'), async (req: Request, res: Response) => {
+  const contribution = await ContributionModel.findById(req.params['id']);
+  if (!contribution) {
+    res.status(404).json({ success: false, error: 'Contribution not found.' });
+    return;
+  }
+  if (contribution.status !== 'pending') {
+    res.status(400).json({ success: false, error: 'Only pending contributions can be approved.' });
+    return;
+  }
+
+  // Verify creator owns the campaign
+  const campaign = await CampaignModel.findById(contribution.campaign_id);
+  if (!campaign || campaign.creator_id.toString() !== req.user!.id) {
+    res.status(403).json({ success: false, error: 'You can only approve contributions to your own campaigns.' });
+    return;
+  }
+
+  // Atomic: mark approved + add to raised_amount in parallel
+  await Promise.all([
+    ContributionModel.findByIdAndUpdate(contribution._id, { $set: { status: 'approved' } }),
+    CampaignModel.findByIdAndUpdate(campaign._id, { $inc: { raised_amount: contribution.amount } }),
+  ]);
+
+  res.json({ success: true, message: 'Contribution approved. Credits added to campaign.' });
+});
+
+// ── PATCH /api/contributions/:id/reject  (Creator — reject + refund supporter) ─
+app.patch('/api/contributions/:id/reject', verifyToken, roleGuard('creator'), async (req: Request, res: Response) => {
+  const contribution = await ContributionModel.findById(req.params['id']);
+  if (!contribution) {
+    res.status(404).json({ success: false, error: 'Contribution not found.' });
+    return;
+  }
+  if (contribution.status !== 'pending') {
+    res.status(400).json({ success: false, error: 'Only pending contributions can be rejected.' });
+    return;
+  }
+
+  // Verify creator owns the campaign
+  const campaign = await CampaignModel.findById(contribution.campaign_id);
+  if (!campaign || campaign.creator_id.toString() !== req.user!.id) {
+    res.status(403).json({ success: false, error: 'You can only reject contributions to your own campaigns.' });
+    return;
+  }
+
+  // Atomic: mark rejected + refund credits to supporter in parallel
+  await Promise.all([
+    ContributionModel.findByIdAndUpdate(contribution._id, { $set: { status: 'rejected' } }),
+    UserModel.findByIdAndUpdate(contribution.supporter_id, { $inc: { credits: contribution.amount } }),
+  ]);
+
+  res.json({ success: true, message: 'Contribution rejected. Credits refunded to supporter.' });
+});
+
 
 // ============================================================
 // 11. WITHDRAWAL ROUTES
