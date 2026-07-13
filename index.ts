@@ -475,6 +475,27 @@ app.get('/api/auth/me', async (req: Request, res: Response) => {
   }
 });
 
+// ── PATCH /api/auth/profile ───────────────────────────
+app.patch('/api/auth/profile', verifyToken, async (req: Request, res: Response) => {
+  const userId = (req as any).user.id;
+  const { name, photoURL } = req.body as { name?: string; photoURL?: string };
+
+  const updateData: any = {};
+  if (name !== undefined) updateData.name = name;
+  if (photoURL !== undefined) updateData.photoURL = photoURL;
+
+  try {
+    const updatedUser = await UserModel.findByIdAndUpdate(userId, updateData, { new: true });
+    if (!updatedUser) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+    res.json({ success: true, data: stripUser(updatedUser), message: 'Profile updated successfully' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Failed to update profile' });
+  }
+});
+
 // ============================================================
 // 9. CAMPAIGN ROUTES
 // ============================================================
