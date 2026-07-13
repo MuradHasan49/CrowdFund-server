@@ -149,8 +149,9 @@ const userSchema = new Schema<IUser>(
   },
   { timestamps: true }
 );
-userSchema.index({ email: 1 }, { unique: true });
+userSchema.set('toJSON', { virtuals: true });
 const UserModel = mongoose.model<IUser>('User', userSchema);
+
 
 // ── Campaign Model ───────────────────────────────────────────
 const campaignSchema = new Schema<ICampaign>(
@@ -232,18 +233,172 @@ const CreditPurchaseModel = mongoose.model<ICreditPurchase>('CreditPurchase', cr
 
 // ============================================================
 // 6. EXPRESS APP & MIDDLEWARE
-// (Populated in Phase 3)
 // ============================================================
+const app = express();
+
+app.use(cors({
+  origin: process.env.CLIENT_URL || 'http://localhost:3000',
+  credentials: true,   // required for httpOnly cookies cross-origin
+}));
+app.use(express.json());
+app.use(cookieParser());
+
+// Health check
+app.get('/', (_req: Request, res: Response) => {
+  res.json({ success: true, message: 'CrowdFund API 🚀' });
+});
+app.get('/health', (_req: Request, res: Response) => {
+  res.json({ success: true, message: 'Server is healthy', timestamp: new Date().toISOString() });
+});
 
 // ============================================================
 // 7. AUTH MIDDLEWARE (verifyToken, roleGuard, setAuthCookie)
-// (Populated in Phase 3)
 // ============================================================
+
+// ── verifyToken: reads JWT from httpOnly cookie ───────────────
+function verifyToken(req: Request, res: Response, next: NextFunction): void {
+  const token = req.cookies?.cf_token as string | undefined;
+  if (!token) {
+    res.status(401).json({ success: false, error: 'Authentication required. Please log in.' });
+    return;
+  }
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET!) as {
+      id: string;
+      role: UserRole;
+      email: string;
+    };
+    req.user = { id: payload.id, role: payload.role, email: payload.email };
+    next();
+  } catch {
+    res.status(401).json({ success: false, error: 'Session expired. Please log in again.' });
+  }
+}
+
+// ── roleGuard: restricts route to specific roles ────────────
+function roleGuard(...roles: UserRole[]) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    if (!req.user || !roles.includes(req.user.role)) {
+      res.status(403).json({ success: false, error: 'Access denied. Insufficient permissions.' });
+      return;
+    }
+    next();
+  };
+}
+
+// ── setAuthCookie: signs JWT and sets httpOnly cookie ────────
+function setAuthCookie(res: Response, userId: string, role: UserRole, email: string): void {
+  const token = jwt.sign(
+    { id: userId, role, email },
+    process.env.JWT_SECRET!,
+    { expiresIn: '7d' }
+  );
+  res.cookie('cf_token', token, {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production',
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days in ms
+  });
+}
+
+// ── stripUser: removes password and __v from user doc ───────
+function stripUser(user: IUser & { _id: Types.ObjectId }) {
+  const obj = user.toObject();
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { password, __v, _id, ...rest } = obj as Record<string, unknown>;
+  return { id: (_id as Types.ObjectId).toString(), ...rest };
+}
 
 // ============================================================
 // 8. AUTH ROUTES  (POST /api/auth/register | /login | /logout | GET /me)
-// (Populated in Phase 3)
 // ============================================================
+
+// ── POST /api/auth/register ────────────────────────────
+app.post('/api/auth/register', async (req: Request, res: Response) => {
+  const { name, email, password, role, photoURL } = req.body as {
+    name: string;
+    email: string;
+    password: string;
+    role: UserRole;
+    photoURL?: string;
+  };
+
+  if (!name || !email || !password || !role) {
+    res.status(400).json({ success: false, error: 'Name, email, password, and role are required.' });
+    return;
+  }
+  if (!['supporter', 'creator'].includes(role)) {
+    res.status(400).json({ success: false, error: 'Role must be supporter or creator.' });
+    return;
+  }
+
+  const existing = await UserModel.findOne({ email: email.toLowerCase() });
+  if (existing) {
+    res.status(409).json({ success: false, error: 'An account with this email already exists.' });
+    return;
+  }
+
+  const hashedPassword = await bcrypt.hash(password, BCRYPT_SALT_ROUNDS);
+  const credits = role === 'supporter' ? SUPPORTER_SIGNUP_CREDITS : CREATOR_SIGNUP_CREDITS;
+
+  const user = await UserModel.create({
+    name,
+    email,
+    password: hashedPassword,
+    role,
+    photoURL: photoURL || '',
+    credits,
+  });
+
+  setAuthCookie(res, (user._id as Types.ObjectId).toString(), user.role, user.email);
+  res.status(201).json({ success: true, data: stripUser(user), message: 'Account created successfully.' });
+});
+
+// ── POST /api/auth/login ───────────────────────────────
+app.post('/api/auth/login', async (req: Request, res: Response) => {
+  const { email, password } = req.body as { email: string; password: string };
+
+  if (!email || !password) {
+    res.status(400).json({ success: false, error: 'Email and password are required.' });
+    return;
+  }
+
+  const user = await UserModel.findOne({ email: email.toLowerCase() });
+  if (!user) {
+    res.status(401).json({ success: false, error: 'Invalid email or password.' });
+    return;
+  }
+
+  if (!user.isActive) {
+    res.status(403).json({ success: false, error: 'Your account has been deactivated. Contact support.' });
+    return;
+  }
+
+  const isMatch = await bcrypt.compare(password, user.password);
+  if (!isMatch) {
+    res.status(401).json({ success: false, error: 'Invalid email or password.' });
+    return;
+  }
+
+  setAuthCookie(res, (user._id as Types.ObjectId).toString(), user.role, user.email);
+  res.json({ success: true, data: stripUser(user), message: 'Logged in successfully.' });
+});
+
+// ── POST /api/auth/logout ─────────────────────────────
+app.post('/api/auth/logout', (_req: Request, res: Response) => {
+  res.clearCookie('cf_token', { httpOnly: true, sameSite: 'lax' });
+  res.json({ success: true, message: 'Logged out successfully.' });
+});
+
+// ── GET /api/auth/me ─────────────────────────────────
+app.get('/api/auth/me', verifyToken, async (req: Request, res: Response) => {
+  const user = await UserModel.findById(req.user!.id);
+  if (!user) {
+    res.status(404).json({ success: false, error: 'User not found.' });
+    return;
+  }
+  res.json({ success: true, data: stripUser(user) });
+});
 
 // ============================================================
 // 9. CAMPAIGN ROUTES
@@ -278,19 +433,6 @@ const CreditPurchaseModel = mongoose.model<ICreditPurchase>('CreditPurchase', cr
 // ============================================================
 // 15. SERVER LISTEN
 // ============================================================
-const app = express();
-app.use(cors({ origin: process.env.CLIENT_URL || 'http://localhost:3000', credentials: true }));
-app.use(express.json());
-app.use(cookieParser());
-
-app.get('/', (_req: Request, res: Response) => {
-  res.json({ success: true, message: 'CrowdFund API 🚀' });
-});
-
-app.get('/health', (_req: Request, res: Response) => {
-  res.json({ success: true, message: 'Server is healthy', timestamp: new Date().toISOString() });
-});
-
 app.listen(PORT, () => {
-  console.error(`✅ Server running at http://localhost:${PORT}`);
+  console.error(`✅ CrowdFund server running at http://localhost:${PORT}`);
 });
