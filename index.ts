@@ -42,7 +42,6 @@ mongoose
 
 // ============================================================
 // 4. TYPESCRIPT INTERFACES
-// (Populated in Phase 2)
 // ============================================================
 
 // Global Express Request augmentation — req.user available in all routes
@@ -58,10 +57,178 @@ declare global {
   }
 }
 
+type UserRole = 'supporter' | 'creator' | 'admin';
+type CampaignStatus = 'pending' | 'active' | 'rejected' | 'closed';
+type ContributionStatus = 'pending' | 'approved' | 'rejected';
+type WithdrawalStatus = 'pending' | 'approved' | 'rejected';
+type PaymentSystem = 'stripe' | 'bkash' | 'rocket' | 'nagad';
+type CreditPurchaseStatus = 'pending' | 'completed' | 'failed';
+type CampaignCategory = 'Technology' | 'Art' | 'Community' | 'Health' | 'Education' | 'Other';
+
+interface IUser extends Document {
+  name: string;
+  email: string;
+  photoURL: string;
+  password: string;
+  role: UserRole;
+  credits: number;
+  isActive: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+interface ICampaign extends Document {
+  title: string;
+  campaign_story: string;
+  category: CampaignCategory;
+  funding_goal: number;
+  minimum_contribution: number;
+  deadline: Date;
+  reward_info: string;
+  campaign_image_url: string;
+  creator_id: Types.ObjectId;
+  creator_name: string;
+  creator_email: string;
+  raised_amount: number;
+  status: CampaignStatus;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+interface IContribution extends Document {
+  campaign_id: Types.ObjectId;
+  campaign_title: string;
+  supporter_id: Types.ObjectId;
+  supporter_name: string;
+  supporter_email: string;
+  amount: number;
+  message?: string;
+  status: ContributionStatus;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+interface IWithdrawal extends Document {
+  creator_id: Types.ObjectId;
+  creator_name: string;
+  creator_email: string;
+  withdrawal_credit: number;
+  withdrawal_amount: number;
+  payment_system: PaymentSystem;
+  account_number: string;
+  withdraw_date: Date;
+  status: WithdrawalStatus;
+  createdAt: Date;
+}
+
+interface ICreditPurchase extends Document {
+  user_id: Types.ObjectId;
+  user_email: string;
+  amount_usd: number;
+  credits_received: number;
+  payment_method: string;
+  payment_intent_id?: string;
+  status: CreditPurchaseStatus;
+  createdAt: Date;
+}
+
 // ============================================================
 // 5. MONGOOSE MODELS
-// (Populated in Phase 2)
 // ============================================================
+
+// ── User Model ──────────────────────────────────────────────
+const userSchema = new Schema<IUser>(
+  {
+    name:      { type: String, required: true, trim: true },
+    email:     { type: String, required: true, unique: true, lowercase: true, trim: true },
+    photoURL:  { type: String, default: '' },
+    password:  { type: String, required: true },
+    role:      { type: String, enum: ['supporter', 'creator', 'admin'], required: true },
+    credits:   { type: Number, default: 0 },
+    isActive:  { type: Boolean, default: true },
+  },
+  { timestamps: true }
+);
+userSchema.index({ email: 1 }, { unique: true });
+const UserModel = mongoose.model<IUser>('User', userSchema);
+
+// ── Campaign Model ───────────────────────────────────────────
+const campaignSchema = new Schema<ICampaign>(
+  {
+    title:                { type: String, required: true, trim: true },
+    campaign_story:       { type: String, required: true },
+    category:             { type: String, enum: ['Technology', 'Art', 'Community', 'Health', 'Education', 'Other'], required: true },
+    funding_goal:         { type: Number, required: true, min: 100 },
+    minimum_contribution: { type: Number, required: true, min: 1 },
+    deadline:             { type: Date, required: true },
+    reward_info:          { type: String, required: true },
+    campaign_image_url:   { type: String, required: true },
+    creator_id:           { type: Schema.Types.ObjectId, ref: 'User', required: true },
+    creator_name:         { type: String, required: true },
+    creator_email:        { type: String, required: true },
+    raised_amount:        { type: Number, default: 0 },
+    status:               { type: String, enum: ['pending', 'active', 'rejected', 'closed'], default: 'pending' },
+  },
+  { timestamps: true }
+);
+campaignSchema.index({ status: 1, raised_amount: -1 });        // top funded
+campaignSchema.index({ creator_id: 1, deadline: -1 });         // my campaigns
+campaignSchema.index({ category: 1, status: 1 });              // filter by category
+campaignSchema.index({ title: 'text', campaign_story: 'text' }); // full-text search
+const CampaignModel = mongoose.model<ICampaign>('Campaign', campaignSchema);
+
+// ── Contribution Model ───────────────────────────────────────
+const contributionSchema = new Schema<IContribution>(
+  {
+    campaign_id:     { type: Schema.Types.ObjectId, ref: 'Campaign', required: true },
+    campaign_title:  { type: String, required: true },
+    supporter_id:    { type: Schema.Types.ObjectId, ref: 'User', required: true },
+    supporter_name:  { type: String, required: true },
+    supporter_email: { type: String, required: true },
+    amount:          { type: Number, required: true, min: 1 },
+    message:         { type: String, default: '' },
+    status:          { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
+  },
+  { timestamps: true }
+);
+contributionSchema.index({ campaign_id: 1, status: 1 });
+contributionSchema.index({ supporter_id: 1, createdAt: -1 });
+const ContributionModel = mongoose.model<IContribution>('Contribution', contributionSchema);
+
+// ── Withdrawal Model ─────────────────────────────────────────
+const withdrawalSchema = new Schema<IWithdrawal>(
+  {
+    creator_id:        { type: Schema.Types.ObjectId, ref: 'User', required: true },
+    creator_name:      { type: String, required: true },
+    creator_email:     { type: String, required: true },
+    withdrawal_credit: { type: Number, required: true, min: MIN_WITHDRAWAL_CREDITS },
+    withdrawal_amount: { type: Number, required: true },
+    payment_system:    { type: String, enum: ['stripe', 'bkash', 'rocket', 'nagad'], required: true },
+    account_number:    { type: String, required: true },
+    withdraw_date:     { type: Date, default: Date.now },
+    status:            { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
+  },
+  { timestamps: true }
+);
+withdrawalSchema.index({ creator_id: 1, createdAt: -1 });
+withdrawalSchema.index({ status: 1 });
+const WithdrawalModel = mongoose.model<IWithdrawal>('Withdrawal', withdrawalSchema);
+
+// ── Credit Purchase Model ────────────────────────────────────
+const creditPurchaseSchema = new Schema<ICreditPurchase>(
+  {
+    user_id:           { type: Schema.Types.ObjectId, ref: 'User', required: true },
+    user_email:        { type: String, required: true },
+    amount_usd:        { type: Number, required: true, min: 1 },
+    credits_received:  { type: Number, required: true },
+    payment_method:    { type: String, required: true },
+    payment_intent_id: { type: String },
+    status:            { type: String, enum: ['pending', 'completed', 'failed'], default: 'completed' },
+  },
+  { timestamps: true }
+);
+creditPurchaseSchema.index({ user_id: 1, createdAt: -1 });
+const CreditPurchaseModel = mongoose.model<ICreditPurchase>('CreditPurchase', creditPurchaseSchema);
 
 // ============================================================
 // 6. EXPRESS APP & MIDDLEWARE
