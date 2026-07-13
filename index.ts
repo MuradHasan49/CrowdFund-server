@@ -402,8 +402,258 @@ app.get('/api/auth/me', verifyToken, async (req: Request, res: Response) => {
 
 // ============================================================
 // 9. CAMPAIGN ROUTES
-// (Populated in Phase 4)
 // ============================================================
+
+// helper — strip Mongoose doc to plain safe object
+function stripCampaign(doc: ICampaign & { _id: Types.ObjectId }) {
+  const obj = doc.toObject() as Record<string, unknown>;
+  const { _id, __v, ...rest } = obj;
+  return { id: (_id as Types.ObjectId).toString(), ...rest };
+}
+
+// ── GET /api/campaigns  (public, filterable, paginated) ──────
+app.get('/api/campaigns', async (req: Request, res: Response) => {
+  const {
+    search   = '',
+    category = '',
+    status   = 'active',
+    sort     = 'raised',
+    page     = '1',
+    limit    = '12',
+  } = req.query as Record<string, string>;
+
+  const filter: Record<string, unknown> = {};
+
+  // Status filter — default to active for public listing
+  if (status && status !== 'all') {
+    filter.status = status;
+  }
+
+  // Category filter
+  if (category) filter.category = category;
+
+  // Full-text search
+  if (search.trim()) {
+    filter.$text = { $search: search.trim() };
+  }
+
+  // Sort map
+  const sortMap: Record<string, Record<string, 1 | -1>> = {
+    raised:   { raised_amount: -1 },
+    newest:   { createdAt: -1 },
+    deadline: { deadline: 1 },
+    alpha:    { title: 1 },
+  };
+  const sortBy = sortMap[sort] ?? sortMap['raised'];
+
+  const pageNum  = Math.max(1, parseInt(page, 10));
+  const limitNum = Math.min(50, Math.max(1, parseInt(limit, 10)));
+  const skip     = (pageNum - 1) * limitNum;
+
+  const [campaigns, total] = await Promise.all([
+    CampaignModel.find(filter).sort(sortBy).skip(skip).limit(limitNum).lean(),
+    CampaignModel.countDocuments(filter),
+  ]);
+
+  res.json({
+    success: true,
+    data: campaigns.map((c) => {
+      const { _id, __v, ...rest } = c as typeof c & { __v?: number };
+      return { id: (_id as Types.ObjectId).toString(), ...rest };
+    }),
+    meta: { total, page: pageNum, limit: limitNum, pages: Math.ceil(total / limitNum) },
+  });
+});
+
+// ── GET /api/campaigns/top  (public — top 6 by raised_amount) ─
+// ⚠️ MUST be before /:id to avoid Express treating "top" as a param
+app.get('/api/campaigns/top', async (_req: Request, res: Response) => {
+  const campaigns = await CampaignModel.find({ status: 'active' })
+    .sort({ raised_amount: -1 })
+    .limit(6)
+    .lean();
+
+  res.json({
+    success: true,
+    data: campaigns.map((c) => {
+      const { _id, __v, ...rest } = c as typeof c & { __v?: number };
+      return { id: (_id as Types.ObjectId).toString(), ...rest };
+    }),
+  });
+});
+
+// ── GET /api/campaigns/mine  (Creator — own campaigns) ────────
+// ⚠️ MUST be before /:id
+app.get('/api/campaigns/mine', verifyToken, roleGuard('creator'), async (req: Request, res: Response) => {
+  const campaigns = await CampaignModel.find({ creator_id: req.user!.id })
+    .sort({ deadline: -1 })
+    .lean();
+
+  res.json({
+    success: true,
+    data: campaigns.map((c) => {
+      const { _id, __v, ...rest } = c as typeof c & { __v?: number };
+      return { id: (_id as Types.ObjectId).toString(), ...rest };
+    }),
+  });
+});
+
+// ── GET /api/campaigns/:id  (public — single campaign) ────────
+app.get('/api/campaigns/:id', async (req: Request, res: Response) => {
+  const campaign = await CampaignModel.findById(req.params['id']);
+  if (!campaign) {
+    res.status(404).json({ success: false, error: 'Campaign not found.' });
+    return;
+  }
+  res.json({ success: true, data: stripCampaign(campaign) });
+});
+
+// ── POST /api/campaigns  (Creator — create campaign) ──────────
+app.post('/api/campaigns', verifyToken, roleGuard('creator'), async (req: Request, res: Response) => {
+  const {
+    title,
+    campaign_story,
+    category,
+    funding_goal,
+    minimum_contribution,
+    deadline,
+    reward_info,
+    campaign_image_url,
+  } = req.body as {
+    title: string;
+    campaign_story: string;
+    category: CampaignCategory;
+    funding_goal: number;
+    minimum_contribution: number;
+    deadline: string;
+    reward_info: string;
+    campaign_image_url: string;
+  };
+
+  if (!title || !campaign_story || !category || !funding_goal || !minimum_contribution || !deadline || !reward_info || !campaign_image_url) {
+    res.status(400).json({ success: false, error: 'All campaign fields are required.' });
+    return;
+  }
+  if (new Date(deadline) <= new Date()) {
+    res.status(400).json({ success: false, error: 'Deadline must be in the future.' });
+    return;
+  }
+  if (Number(funding_goal) < 100) {
+    res.status(400).json({ success: false, error: 'Funding goal must be at least 100 credits.' });
+    return;
+  }
+  if (Number(minimum_contribution) < 1 || Number(minimum_contribution) > Number(funding_goal)) {
+    res.status(400).json({ success: false, error: 'Minimum contribution must be between 1 and the funding goal.' });
+    return;
+  }
+
+  const creator = await UserModel.findById(req.user!.id).lean();
+  if (!creator) {
+    res.status(404).json({ success: false, error: 'Creator not found.' });
+    return;
+  }
+
+  const campaign = await CampaignModel.create({
+    title: title.trim(),
+    campaign_story,
+    category,
+    funding_goal: Number(funding_goal),
+    minimum_contribution: Number(minimum_contribution),
+    deadline: new Date(deadline),
+    reward_info,
+    campaign_image_url,
+    creator_id:    creator._id,
+    creator_name:  creator.name,
+    creator_email: creator.email,
+    raised_amount: 0,
+    status: 'pending',
+  });
+
+  res.status(201).json({ success: true, data: stripCampaign(campaign), message: 'Campaign submitted for review.' });
+});
+
+// ── PATCH /api/campaigns/:id  (Creator — update title/story/reward) ─
+app.patch('/api/campaigns/:id', verifyToken, roleGuard('creator'), async (req: Request, res: Response) => {
+  const campaign = await CampaignModel.findById(req.params['id']);
+  if (!campaign) {
+    res.status(404).json({ success: false, error: 'Campaign not found.' });
+    return;
+  }
+  if (campaign.creator_id.toString() !== req.user!.id) {
+    res.status(403).json({ success: false, error: 'You can only edit your own campaigns.' });
+    return;
+  }
+
+  const { title, campaign_story, reward_info } = req.body as {
+    title?: string;
+    campaign_story?: string;
+    reward_info?: string;
+  };
+
+  if (title)           campaign.title = title.trim();
+  if (campaign_story)  campaign.campaign_story = campaign_story;
+  if (reward_info)     campaign.reward_info = reward_info;
+
+  await campaign.save();
+  res.json({ success: true, data: stripCampaign(campaign), message: 'Campaign updated.' });
+});
+
+// ── DELETE /api/campaigns/:id  (Creator — delete + bulk refund) ─
+app.delete('/api/campaigns/:id', verifyToken, roleGuard('creator'), async (req: Request, res: Response) => {
+  const campaign = await CampaignModel.findById(req.params['id']);
+  if (!campaign) {
+    res.status(404).json({ success: false, error: 'Campaign not found.' });
+    return;
+  }
+  if (campaign.creator_id.toString() !== req.user!.id) {
+    res.status(403).json({ success: false, error: 'You can only delete your own campaigns.' });
+    return;
+  }
+
+  // Bulk refund all approved contributions atomically
+  const approved = await ContributionModel.find({ campaign_id: campaign._id, status: 'approved' }).lean();
+  await Promise.all(
+    approved.map((c) =>
+      UserModel.findByIdAndUpdate(c.supporter_id, { $inc: { credits: c.amount } })
+    )
+  );
+
+  // Reject pending contributions (no refund — credits already deducted but not yet approved)
+  await ContributionModel.updateMany(
+    { campaign_id: campaign._id, status: 'pending' },
+    { $set: { status: 'rejected' } }
+  );
+
+  await CampaignModel.findByIdAndDelete(campaign._id);
+  res.json({ success: true, message: `Campaign deleted. ${approved.length} contribution(s) refunded.` });
+});
+
+// ── PATCH /api/campaigns/:id/status  (Admin — approve / reject) ─
+app.patch('/api/campaigns/:id/status', verifyToken, roleGuard('admin'), async (req: Request, res: Response) => {
+  const { status } = req.body as { status: CampaignStatus };
+
+  if (!['active', 'rejected'].includes(status)) {
+    res.status(400).json({ success: false, error: 'Status must be "active" or "rejected".' });
+    return;
+  }
+
+  const campaign = await CampaignModel.findByIdAndUpdate(
+    req.params['id'],
+    { $set: { status } },
+    { new: true }
+  );
+  if (!campaign) {
+    res.status(404).json({ success: false, error: 'Campaign not found.' });
+    return;
+  }
+
+  res.json({
+    success: true,
+    data: stripCampaign(campaign),
+    message: status === 'active' ? 'Campaign approved and now live.' : 'Campaign rejected.',
+  });
+});
+
 
 // ============================================================
 // 10. CONTRIBUTION ROUTES
