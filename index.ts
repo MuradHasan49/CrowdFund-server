@@ -384,6 +384,68 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
   res.json({ success: true, data: stripUser(user), message: 'Logged in successfully.' });
 });
 
+// ── POST /api/auth/social ────────────────────────────
+app.post('/api/auth/social', async (req: Request, res: Response) => {
+  const { provider, token } = req.body as { provider: 'google' | 'facebook'; token: string };
+
+  if (!provider || !token) {
+    res.status(400).json({ success: false, error: 'Provider and token are required.' });
+    return;
+  }
+
+  let name = '';
+  let email = '';
+  let photoURL = '';
+
+  try {
+    if (provider === 'google') {
+      const googleRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (!googleRes.ok) throw new Error('Invalid Google token');
+      const payload = await googleRes.json();
+      if (!payload || !payload.email) throw new Error('Invalid Google payload');
+      name = payload.name || 'Google User';
+      email = payload.email.toLowerCase();
+      photoURL = payload.picture || '';
+    } else if (provider === 'facebook') {
+      // Validate Facebook Access Token
+      const fbRes = await fetch(`https://graph.facebook.com/me?access_token=${token}&fields=id,name,email,picture`);
+      if (!fbRes.ok) throw new Error('Invalid Facebook token');
+      const fbData = await fbRes.json();
+      if (!fbData.email) throw new Error('Facebook account has no email attached');
+      
+      name = fbData.name || 'Facebook User';
+      email = fbData.email.toLowerCase();
+      photoURL = fbData.picture?.data?.url || '';
+    } else {
+      res.status(400).json({ success: false, error: 'Invalid provider.' });
+      return;
+    }
+  } catch (error: any) {
+    console.error('Social Auth Error:', error.message);
+    res.status(401).json({ success: false, error: 'Failed to authenticate with provider.' });
+    return;
+  }
+
+  // Find user by email or create new supporter
+  let user = await UserModel.findOne({ email });
+  if (!user) {
+    user = await UserModel.create({
+      name,
+      email,
+      password: '', // No password for social accounts (can't login via normal password unless reset)
+      role: 'supporter', // Always supporter for social
+      photoURL,
+      credits: SUPPORTER_SIGNUP_CREDITS,
+      isActive: true,
+    });
+  }
+
+  setAuthCookie(res, (user._id as Types.ObjectId).toString(), user.role, user.email);
+  res.json({ success: true, data: stripUser(user), message: 'Login successful' });
+});
+
 // ── POST /api/auth/logout ─────────────────────────────
 app.post('/api/auth/logout', (_req: Request, res: Response) => {
   res.clearCookie('cf_token', { httpOnly: true, sameSite: 'lax' });
@@ -791,10 +853,11 @@ app.patch('/api/contributions/:id/approve', verifyToken, roleGuard('creator'), a
     return;
   }
 
-  // Atomic: mark approved + add to raised_amount in parallel
+  // Atomic: mark approved + add to raised_amount and creator credits in parallel
   await Promise.all([
     ContributionModel.findByIdAndUpdate(contribution._id, { $set: { status: 'approved' } }),
     CampaignModel.findByIdAndUpdate(campaign._id, { $inc: { raised_amount: contribution.amount } }),
+    UserModel.findByIdAndUpdate(req.user!.id, { $inc: { credits: contribution.amount } }),
   ]);
 
   res.json({ success: true, message: 'Contribution approved. Credits added to campaign.' });
@@ -863,6 +926,11 @@ app.post('/api/withdrawals', verifyToken, roleGuard('creator'), async (req: Requ
     return;
   }
 
+  if (creator.credits < Number(withdrawal_credit)) {
+    res.status(400).json({ success: false, error: 'Insufficient credits.' });
+    return;
+  }
+
   const withdrawal_amount = Number(withdrawal_credit) / CREDIT_WITHDRAWAL_RATE;
 
   const withdrawal = await WithdrawalModel.create({
@@ -876,6 +944,9 @@ app.post('/api/withdrawals', verifyToken, roleGuard('creator'), async (req: Requ
     withdraw_date:     new Date(),
     status:            'pending',
   });
+
+  // Deduct credits from user
+  await UserModel.findByIdAndUpdate(req.user!.id, { $inc: { credits: -Number(withdrawal_credit) } });
 
   const obj = withdrawal.toObject() as unknown as Record<string, unknown>;
   const { _id, __v, ...rest } = obj;
@@ -943,8 +1014,11 @@ app.patch('/api/withdrawals/:id/reject', verifyToken, roleGuard('admin'), async 
     return;
   }
 
-  await WithdrawalModel.findByIdAndUpdate(withdrawal._id, { $set: { status: 'rejected' } });
-  res.json({ success: true, message: 'Withdrawal request rejected.' });
+  await Promise.all([
+    WithdrawalModel.findByIdAndUpdate(withdrawal._id, { $set: { status: 'rejected' } }),
+    UserModel.findByIdAndUpdate(withdrawal.creator_id, { $inc: { credits: withdrawal.withdrawal_credit } }),
+  ]);
+  res.json({ success: true, message: 'Withdrawal request rejected and credits refunded.' });
 });
 
 // ============================================================
