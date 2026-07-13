@@ -818,23 +818,278 @@ app.patch('/api/contributions/:id/reject', verifyToken, roleGuard('creator'), as
 
 // ============================================================
 // 11. WITHDRAWAL ROUTES
-// (Populated in Phase 6)
 // ============================================================
+
+// ── POST /api/withdrawals  (Creator — request withdrawal) ────
+app.post('/api/withdrawals', verifyToken, roleGuard('creator'), async (req: Request, res: Response) => {
+  const { withdrawal_credit, payment_system, account_number } = req.body as {
+    withdrawal_credit: number;
+    payment_system: PaymentSystem;
+    account_number: string;
+  };
+
+  if (!withdrawal_credit || !payment_system || !account_number) {
+    res.status(400).json({ success: false, error: 'withdrawal_credit, payment_system, and account_number are required.' });
+    return;
+  }
+  if (Number(withdrawal_credit) < MIN_WITHDRAWAL_CREDITS) {
+    res.status(400).json({
+      success: false,
+      error: `Minimum withdrawal is ${MIN_WITHDRAWAL_CREDITS} credits ($${MIN_WITHDRAWAL_CREDITS / CREDIT_WITHDRAWAL_RATE}).`,
+    });
+    return;
+  }
+  if (!['stripe', 'bkash', 'rocket', 'nagad'].includes(payment_system)) {
+    res.status(400).json({ success: false, error: 'Invalid payment system.' });
+    return;
+  }
+
+  const creator = await UserModel.findById(req.user!.id).lean();
+  if (!creator) {
+    res.status(404).json({ success: false, error: 'Creator not found.' });
+    return;
+  }
+
+  const withdrawal_amount = Number(withdrawal_credit) / CREDIT_WITHDRAWAL_RATE;
+
+  const withdrawal = await WithdrawalModel.create({
+    creator_id:        req.user!.id,
+    creator_name:      creator.name,
+    creator_email:     creator.email,
+    withdrawal_credit: Number(withdrawal_credit),
+    withdrawal_amount,
+    payment_system,
+    account_number:    account_number.trim(),
+    withdraw_date:     new Date(),
+    status:            'pending',
+  });
+
+  const obj = withdrawal.toObject() as unknown as Record<string, unknown>;
+  const { _id, __v, ...rest } = obj;
+  res.status(201).json({
+    success: true,
+    data: { id: (withdrawal._id as Types.ObjectId).toString(), ...rest },
+    message: 'Withdrawal request submitted. Awaiting admin approval.',
+  });
+});
+
+// ── GET /api/withdrawals/mine  (Creator — own withdrawal history) ─
+// ⚠️ MUST be before /:id
+app.get('/api/withdrawals/mine', verifyToken, roleGuard('creator'), async (req: Request, res: Response) => {
+  const withdrawals = await WithdrawalModel.find({ creator_id: req.user!.id })
+    .sort({ createdAt: -1 })
+    .lean();
+
+  res.json({
+    success: true,
+    data: withdrawals.map((w) => {
+      const { _id, __v, ...rest } = w as typeof w & { __v?: number };
+      return { id: (_id as Types.ObjectId).toString(), ...rest };
+    }),
+  });
+});
+
+// ── GET /api/withdrawals  (Admin — all withdrawal requests) ───
+app.get('/api/withdrawals', verifyToken, roleGuard('admin'), async (_req: Request, res: Response) => {
+  const withdrawals = await WithdrawalModel.find().sort({ createdAt: -1 }).lean();
+
+  res.json({
+    success: true,
+    data: withdrawals.map((w) => {
+      const { _id, __v, ...rest } = w as typeof w & { __v?: number };
+      return { id: (_id as Types.ObjectId).toString(), ...rest };
+    }),
+  });
+});
+
+// ── PATCH /api/withdrawals/:id/approve  (Admin) ───────────────
+app.patch('/api/withdrawals/:id/approve', verifyToken, roleGuard('admin'), async (req: Request, res: Response) => {
+  const withdrawal = await WithdrawalModel.findById(req.params['id']);
+  if (!withdrawal) {
+    res.status(404).json({ success: false, error: 'Withdrawal request not found.' });
+    return;
+  }
+  if (withdrawal.status !== 'pending') {
+    res.status(400).json({ success: false, error: 'Only pending withdrawals can be approved.' });
+    return;
+  }
+
+  await WithdrawalModel.findByIdAndUpdate(withdrawal._id, { $set: { status: 'approved' } });
+  res.json({ success: true, message: `Withdrawal of $${withdrawal.withdrawal_amount} approved.` });
+});
+
+// ── PATCH /api/withdrawals/:id/reject  (Admin) ────────────────
+app.patch('/api/withdrawals/:id/reject', verifyToken, roleGuard('admin'), async (req: Request, res: Response) => {
+  const withdrawal = await WithdrawalModel.findById(req.params['id']);
+  if (!withdrawal) {
+    res.status(404).json({ success: false, error: 'Withdrawal request not found.' });
+    return;
+  }
+  if (withdrawal.status !== 'pending') {
+    res.status(400).json({ success: false, error: 'Only pending withdrawals can be rejected.' });
+    return;
+  }
+
+  await WithdrawalModel.findByIdAndUpdate(withdrawal._id, { $set: { status: 'rejected' } });
+  res.json({ success: true, message: 'Withdrawal request rejected.' });
+});
 
 // ============================================================
 // 12. CREDIT PURCHASE ROUTES
-// (Populated in Phase 6)
 // ============================================================
+
+// ── POST /api/credits/purchase  (Supporter — buy credits) ────
+app.post('/api/credits/purchase', verifyToken, roleGuard('supporter'), async (req: Request, res: Response) => {
+  const { amount_usd, payment_method, payment_intent_id } = req.body as {
+    amount_usd: number;
+    payment_method: string;
+    payment_intent_id?: string;
+  };
+
+  if (!amount_usd || !payment_method) {
+    res.status(400).json({ success: false, error: 'amount_usd and payment_method are required.' });
+    return;
+  }
+  if (Number(amount_usd) < 1) {
+    res.status(400).json({ success: false, error: 'Minimum purchase is $1.' });
+    return;
+  }
+
+  const credits_received = Number(amount_usd) * CREDIT_PURCHASE_RATE;
+
+  // Atomic: save purchase record + add credits to user in parallel
+  const user = await UserModel.findById(req.user!.id).lean();
+  if (!user) {
+    res.status(404).json({ success: false, error: 'User not found.' });
+    return;
+  }
+
+  const [purchase] = await Promise.all([
+    CreditPurchaseModel.create({
+      user_id:          req.user!.id,
+      user_email:       user.email,
+      amount_usd:       Number(amount_usd),
+      credits_received,
+      payment_method,
+      payment_intent_id: payment_intent_id || undefined,
+      status:           'completed',
+    }),
+    UserModel.findByIdAndUpdate(req.user!.id, { $inc: { credits: credits_received } }),
+  ]);
+
+  const obj = purchase.toObject() as unknown as Record<string, unknown>;
+  const { _id, __v, ...rest } = obj;
+  res.status(201).json({
+    success: true,
+    data: { id: (purchase._id as Types.ObjectId).toString(), ...rest },
+    message: `Purchase successful! ${credits_received} credits added to your account.`,
+  });
+});
+
+// ── GET /api/credits/history  (Supporter — purchase history) ──
+app.get('/api/credits/history', verifyToken, async (req: Request, res: Response) => {
+  const history = await CreditPurchaseModel.find({ user_id: req.user!.id })
+    .sort({ createdAt: -1 })
+    .lean();
+
+  res.json({
+    success: true,
+    data: history.map((h) => {
+      const { _id, __v, ...rest } = h as typeof h & { __v?: number };
+      return { id: (_id as Types.ObjectId).toString(), ...rest };
+    }),
+  });
+});
 
 // ============================================================
 // 13. USER MANAGEMENT ROUTES (Admin)
-// (Populated in Phase 6)
 // ============================================================
+
+// ── GET /api/users  (Admin — all users with optional search) ──
+app.get('/api/users', verifyToken, roleGuard('admin'), async (req: Request, res: Response) => {
+  const { search = '' } = req.query as { search?: string };
+
+  const filter: Record<string, unknown> = {};
+  if (search.trim()) {
+    filter.$or = [
+      { name:  { $regex: search.trim(), $options: 'i' } },
+      { email: { $regex: search.trim(), $options: 'i' } },
+    ];
+  }
+
+  const users = await UserModel.find(filter)
+    .select('-password -__v')
+    .sort({ createdAt: -1 })
+    .lean();
+
+  res.json({
+    success: true,
+    data: users.map((u) => {
+      const { _id, ...rest } = u;
+      return { id: (_id as Types.ObjectId).toString(), ...rest };
+    }),
+  });
+});
+
+// ── PATCH /api/users/:id/role  (Admin — change user role) ─────
+app.patch('/api/users/:id/role', verifyToken, roleGuard('admin'), async (req: Request, res: Response) => {
+  const { role } = req.body as { role: UserRole };
+
+  if (!['supporter', 'creator'].includes(role)) {
+    res.status(400).json({ success: false, error: 'Role must be supporter or creator.' });
+    return;
+  }
+
+  const user = await UserModel.findByIdAndUpdate(
+    req.params['id'],
+    { $set: { role } },
+    { new: true, select: '-password -__v' }
+  );
+  if (!user) {
+    res.status(404).json({ success: false, error: 'User not found.' });
+    return;
+  }
+
+  const obj = user.toObject() as unknown as Record<string, unknown>;
+  const { _id, __v, ...rest } = obj;
+  res.json({ success: true, data: { id: (user._id as Types.ObjectId).toString(), ...rest }, message: `Role updated to ${role}.` });
+});
+
+// ── PATCH /api/users/:id/status  (Admin — toggle isActive) ────
+app.patch('/api/users/:id/status', verifyToken, roleGuard('admin'), async (req: Request, res: Response) => {
+  const { isActive } = req.body as { isActive: boolean };
+
+  if (typeof isActive !== 'boolean') {
+    res.status(400).json({ success: false, error: 'isActive must be a boolean.' });
+    return;
+  }
+
+  const user = await UserModel.findByIdAndUpdate(
+    req.params['id'],
+    { $set: { isActive } },
+    { new: true, select: '-password -__v' }
+  );
+  if (!user) {
+    res.status(404).json({ success: false, error: 'User not found.' });
+    return;
+  }
+
+  res.json({
+    success: true,
+    message: `Account ${isActive ? 'activated' : 'deactivated'} successfully.`,
+  });
+});
 
 // ============================================================
 // 14. GLOBAL ERROR HANDLER
-// (Populated in Phase 6)
 // ============================================================
+// Must be the LAST app.use() before app.listen()
+// Express 5: errors thrown in async handlers auto-propagate here
+app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+  console.error('❌ Unhandled error:', err.stack);
+  res.status(500).json({ success: false, error: err.message || 'Internal server error.' });
+});
+
 
 // ============================================================
 // 15. SERVER LISTEN
