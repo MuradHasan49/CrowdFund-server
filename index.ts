@@ -1115,8 +1115,8 @@ app.patch('/api/withdrawals/:id/reject', verifyToken, roleGuard('admin'), async 
 // 12. CREDIT PURCHASE ROUTES
 // ============================================================
 
-// ── POST /api/credits/purchase  (Supporter — buy credits) ────
-app.post('/api/credits/purchase', verifyToken, roleGuard('supporter'), async (req: Request, res: Response) => {
+// ── POST /api/credits/purchase  (Supporter & Creator — buy credits) ────
+app.post('/api/credits/purchase', verifyToken, roleGuard('supporter', 'creator'), async (req: Request, res: Response) => {
   const { amount_usd, payment_method, payment_intent_id } = req.body as {
     amount_usd: number;
     payment_method: string;
