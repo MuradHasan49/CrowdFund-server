@@ -132,6 +132,15 @@ interface ICreditPurchase extends Document {
   createdAt: Date;
 }
 
+interface INotification extends Document {
+  user_id: Types.ObjectId;
+  type: 'success' | 'alert' | 'contribution' | 'info';
+  title: string;
+  message: string;
+  read: boolean;
+  createdAt: Date;
+}
+
 // ============================================================
 // 5. MONGOOSE MODELS
 // ============================================================
@@ -230,6 +239,20 @@ const creditPurchaseSchema = new Schema<ICreditPurchase>(
 );
 creditPurchaseSchema.index({ user_id: 1, createdAt: -1 });
 const CreditPurchaseModel = mongoose.model<ICreditPurchase>('CreditPurchase', creditPurchaseSchema);
+
+// ── Notification Model ───────────────────────────────────────
+const notificationSchema = new Schema<INotification>(
+  {
+    user_id: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+    type:    { type: String, enum: ['success', 'alert', 'contribution', 'info'], required: true },
+    title:   { type: String, required: true },
+    message: { type: String, required: true },
+    read:    { type: Boolean, default: false },
+  },
+  { timestamps: true }
+);
+notificationSchema.index({ user_id: 1, createdAt: -1 });
+const NotificationModel = mongoose.model<INotification>('Notification', notificationSchema);
 
 // ============================================================
 // 6. EXPRESS APP & MIDDLEWARE
@@ -386,7 +409,7 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
 
 // ── POST /api/auth/social ────────────────────────────
 app.post('/api/auth/social', async (req: Request, res: Response) => {
-  const { provider, token } = req.body as { provider: 'google' | 'facebook'; token: string };
+  const { provider, token, role } = req.body as { provider: 'google' | 'facebook'; token: string; role?: 'supporter' | 'creator' };
 
   if (!provider || !token) {
     res.status(400).json({ success: false, error: 'Provider and token are required.' });
@@ -428,18 +451,25 @@ app.post('/api/auth/social', async (req: Request, res: Response) => {
     return;
   }
 
-  // Find user by email or create new supporter
+  // Find user by email or create new supporter/creator
   let user = await UserModel.findOne({ email });
   if (!user) {
+    const assignedRole = (role === 'creator' || role === 'supporter') ? role : 'supporter';
+    const credits = assignedRole === 'creator' ? CREATOR_SIGNUP_CREDITS : SUPPORTER_SIGNUP_CREDITS;
+    
     user = await UserModel.create({
       name,
       email,
-      password: '', // No password for social accounts (can't login via normal password unless reset)
-      role: 'supporter', // Always supporter for social
+      password: `SOCIAL_AUTH_NO_PASS_${Date.now()}_${Math.random()}`, // Random string to pass required:true validation
+      role: assignedRole,
       photoURL,
-      credits: SUPPORTER_SIGNUP_CREDITS,
+      credits,
       isActive: true,
     });
+  } else if (photoURL && !user.photoURL) {
+    // Update existing user with the social photo if they don't have one
+    await UserModel.updateOne({ _id: user._id }, { $set: { photoURL } });
+    user.photoURL = photoURL;
   }
 
   setAuthCookie(res, (user._id as Types.ObjectId).toString(), user.role, user.email);
@@ -528,9 +558,13 @@ app.get('/api/campaigns', async (req: Request, res: Response) => {
   // Category filter
   if (category) filter.category = category;
 
-  // Full-text search
+  // Full-text search (RegExp for partial matches)
   if (search.trim()) {
-    filter.$text = { $search: search.trim() };
+    const regex = new RegExp(search.trim(), 'i');
+    filter.$or = [
+      { title: regex },
+      { campaign_story: regex }
+    ];
   }
 
   // Sort map
@@ -566,7 +600,7 @@ app.get('/api/campaigns', async (req: Request, res: Response) => {
 app.get('/api/campaigns/top', async (_req: Request, res: Response) => {
   const campaigns = await CampaignModel.find({ status: 'active' })
     .sort({ raised_amount: -1 })
-    .limit(6)
+    .limit(8)
     .lean();
 
   res.json({
@@ -582,7 +616,7 @@ app.get('/api/campaigns/top', async (_req: Request, res: Response) => {
 // ⚠️ MUST be before /:id
 app.get('/api/campaigns/mine', verifyToken, roleGuard('creator'), async (req: Request, res: Response) => {
   const campaigns = await CampaignModel.find({ creator_id: req.user!.id })
-    .sort({ deadline: -1 })
+    .sort({ createdAt: -1 })
     .lean();
 
   res.json({
@@ -743,6 +777,15 @@ app.patch('/api/campaigns/:id/status', verifyToken, roleGuard('admin'), async (r
     return;
   }
 
+  await NotificationModel.create({
+    user_id: campaign.creator_id,
+    type: status === 'active' ? 'success' : 'alert',
+    title: status === 'active' ? 'Campaign Approved' : 'Campaign Rejected',
+    message: status === 'active' 
+      ? `Your campaign "${campaign.title}" has been approved and is now live!` 
+      : `Your campaign "${campaign.title}" was rejected.`
+  });
+
   res.json({
     success: true,
     data: stripCampaign(campaign),
@@ -809,6 +852,14 @@ app.post('/api/contributions', verifyToken, roleGuard('supporter'), async (req: 
 
   const obj = contribution.toObject() as unknown as Record<string, unknown>;
   const { _id, __v, ...rest } = obj;
+
+  await NotificationModel.create({
+    user_id: campaign.creator_id,
+    type: 'contribution',
+    title: 'New Contribution!',
+    message: `${supporter.name} contributed ${amount} credits to "${campaign.title}".`
+  });
+
   res.status(201).json({
     success: true,
     data: { id: (contribution._id as Types.ObjectId).toString(), ...rest },
@@ -1020,6 +1071,14 @@ app.patch('/api/withdrawals/:id/approve', verifyToken, roleGuard('admin'), async
   }
 
   await WithdrawalModel.findByIdAndUpdate(withdrawal._id, { $set: { status: 'approved' } });
+  
+  await NotificationModel.create({
+    user_id: withdrawal.creator_id,
+    type: 'success',
+    title: 'Withdrawal Approved',
+    message: `Your withdrawal for $${withdrawal.withdrawal_amount} has been approved.`
+  });
+
   res.json({ success: true, message: `Withdrawal of $${withdrawal.withdrawal_amount} approved.` });
 });
 
@@ -1038,6 +1097,12 @@ app.patch('/api/withdrawals/:id/reject', verifyToken, roleGuard('admin'), async 
   await Promise.all([
     WithdrawalModel.findByIdAndUpdate(withdrawal._id, { $set: { status: 'rejected' } }),
     UserModel.findByIdAndUpdate(withdrawal.creator_id, { $inc: { credits: withdrawal.withdrawal_credit } }),
+    NotificationModel.create({
+      user_id: withdrawal.creator_id,
+      type: 'alert',
+      title: 'Withdrawal Rejected',
+      message: `Your withdrawal for $${withdrawal.withdrawal_amount} was rejected and credits refunded.`
+    })
   ]);
   res.json({ success: true, message: 'Withdrawal request rejected and credits refunded.' });
 });
@@ -1083,6 +1148,12 @@ app.post('/api/credits/purchase', verifyToken, roleGuard('supporter'), async (re
       status:           'completed',
     }),
     UserModel.findByIdAndUpdate(req.user!.id, { $inc: { credits: credits_received } }),
+    NotificationModel.create({
+      user_id: req.user!.id,
+      type: 'success',
+      title: 'Credits Purchased',
+      message: `You successfully purchased ${credits_received} credits.`
+    })
   ]);
 
   const obj = purchase.toObject() as unknown as Record<string, unknown>;
@@ -1189,7 +1260,34 @@ app.patch('/api/users/:id/status', verifyToken, roleGuard('admin'), async (req: 
 });
 
 // ============================================================
-// 14. GLOBAL ERROR HANDLER
+// 14. NOTIFICATION ROUTES
+// ============================================================
+app.get('/api/notifications', verifyToken, async (req: Request, res: Response) => {
+  const notifications = await NotificationModel.find({ user_id: req.user!.id })
+    .sort({ createdAt: -1 })
+    .limit(50)
+    .lean();
+
+  res.json({
+    success: true,
+    data: notifications.map(n => {
+      const { _id, __v, ...rest } = n as typeof n & { __v?: number };
+      return { id: (_id as Types.ObjectId).toString(), ...rest };
+    })
+  });
+});
+
+app.patch('/api/notifications/read', verifyToken, async (req: Request, res: Response) => {
+  await NotificationModel.updateMany(
+    { user_id: req.user!.id, read: false },
+    { $set: { read: true } }
+  );
+
+  res.json({ success: true, message: 'All notifications marked as read' });
+});
+
+// ============================================================
+// 15. GLOBAL ERROR HANDLER
 // ============================================================
 // Must be the LAST app.use() before app.listen()
 // Express 5: errors thrown in async handlers auto-propagate here
@@ -1222,7 +1320,14 @@ const seedAdmin = async () => {
   }
 };
 
-app.listen(PORT, async () => {
-  await seedAdmin();
-  console.error(`✅ CrowdFund server running at http://localhost:${PORT}`);
-});
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(PORT, async () => {
+    await seedAdmin();
+    console.error(`✅ CrowdFund server running at http://localhost:${PORT}`);
+  });
+} else {
+  // In Vercel (production), just execute seed and export the app
+  seedAdmin().catch(console.error);
+}
+
+export default app;
