@@ -466,10 +466,28 @@ app.post('/api/auth/social', async (req: Request, res: Response) => {
       credits,
       isActive: true,
     });
-  } else if (photoURL && !user.photoURL) {
-    // Update existing user with the social photo if they don't have one
-    await UserModel.updateOne({ _id: user._id }, { $set: { photoURL } });
-    user.photoURL = photoURL;
+  } else {
+    // Update existing user if they are missing a photo or a role
+    let needsUpdate = false;
+    const updates: any = {};
+    
+    if (photoURL && !user.photoURL) {
+      updates.photoURL = photoURL;
+      user.photoURL = photoURL;
+      needsUpdate = true;
+    }
+    
+    // Fix for older accounts that have undefined role
+    if (!user.role) {
+      const assignedRole = (role === 'creator' || role === 'supporter') ? role : 'supporter';
+      updates.role = assignedRole;
+      user.role = assignedRole;
+      needsUpdate = true;
+    }
+
+    if (needsUpdate) {
+      await UserModel.updateOne({ _id: user._id }, { $set: updates });
+    }
   }
 
   setAuthCookie(res, (user._id as Types.ObjectId).toString(), user.role, user.email);
