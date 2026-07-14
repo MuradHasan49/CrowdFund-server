@@ -318,7 +318,7 @@ function setAuthCookie(res: Response, userId: string, role: UserRole, email: str
   );
   res.cookie('cf_token', token, {
     httpOnly: true,
-    sameSite: 'lax',
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
     secure: process.env.NODE_ENV === 'production',
     maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days in ms
   });
@@ -478,7 +478,11 @@ app.post('/api/auth/social', async (req: Request, res: Response) => {
 
 // ── POST /api/auth/logout ─────────────────────────────
 app.post('/api/auth/logout', (_req: Request, res: Response) => {
-  res.clearCookie('cf_token', { httpOnly: true, sameSite: 'lax' });
+  res.clearCookie('cf_token', { 
+    httpOnly: true, 
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+    secure: process.env.NODE_ENV === 'production'
+  });
   res.json({ success: true, message: 'Logged out successfully.' });
 });
 
